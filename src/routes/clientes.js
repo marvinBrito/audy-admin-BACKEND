@@ -6,7 +6,29 @@ const supabaseAdmin = require('../services/supabaseAdmin');
 const soloAdminMaestro = require('../middleware/authAdmin');
 
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage() });
+// Límite de tamaño y de tipo: el archivo se lee completo en memoria.
+const EXTENSIONES_PERMITIDAS = ['.xlsx', '.xls', '.csv'];
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    if (!EXTENSIONES_PERMITIDAS.includes(ext)) {
+      return cb(new Error('Solo se aceptan archivos .xlsx, .xls o .csv'));
+    }
+    cb(null, true);
+  },
+});
+
+// Envuelve multer para devolver un 400 legible si el archivo no es válido.
+function subirArchivo(req, res, next) {
+  upload.single('archivo')(req, res, (err) => {
+    if (!err) return next();
+    const mensaje =
+      err.code === 'LIMIT_FILE_SIZE' ? 'El archivo supera el límite de 10 MB' : err.message;
+    return res.status(400).json({ error: mensaje });
+  });
+}
 
 // Columnas obligatorias que debe traer el Excel
 const COLUMNAS_REQUERIDAS = ['codigo', 'descripcion', 'unidad_medida', 'bodega'];
@@ -28,7 +50,9 @@ function parsearArchivo(file) {
 }
 
 // ── Helper: inserta cada fila como producto vía la RPC insertar_producto_catalogo ──
-async function insertarProductos(sufijo, filasNormalizadas) {
+// Usa el cliente del admin maestro (su token), no service_role: la función
+// valida el permiso con auth.uid() a través de puede_gestionar_catalogo_cliente_v1.
+async function insertarProductos(supabaseUsuario, sufijo, filasNormalizadas) {
   const resultados = { insertados: 0, fallidos: [] };
 
   for (const fila of filasNormalizadas) {
@@ -50,7 +74,7 @@ async function insertarProductos(sufijo, filasNormalizadas) {
       .map((b) => b.trim())
       .filter(Boolean);
 
-    const { error: errorInsert } = await supabaseAdmin.rpc('insertar_producto_catalogo', {
+    const { error: errorInsert } = await supabaseUsuario.rpc('insertar_producto_catalogo', {
       p_sufijo: sufijo,
       p_codigo: codigo,
       p_descripcion: descripcion,
@@ -70,10 +94,11 @@ async function insertarProductos(sufijo, filasNormalizadas) {
 }
 
 // POST /clientes/crear
+// Header: Authorization: Bearer <token>  -> sesión del admin maestro (middleware)
 // FormData esperado:
-//   email, password  -> credenciales del admin maestro (validadas en el middleware)
 //   archivo          -> el .xlsx, con nombre "Nombre Comercial_SUFIJO.xlsx"
-router.post('/crear', upload.single('archivo'), soloAdminMaestro, async (req, res) => {
+// La sesión se valida ANTES de recibir el archivo.
+router.post('/crear', soloAdminMaestro, subirArchivo, async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No se recibió ningún archivo' });
@@ -129,7 +154,7 @@ router.post('/crear', upload.single('archivo'), soloAdminMaestro, async (req, re
     }
 
     // ── PASO 4: Insertar cada producto ──
-    const resultados = await insertarProductos(sufijo, filasNormalizadas);
+    const resultados = await insertarProductos(req.supabaseUsuario, sufijo, filasNormalizadas);
 
     return res.status(200).json({
       mensaje: 'Cliente creado correctamente',
@@ -143,7 +168,7 @@ router.post('/crear', upload.single('archivo'), soloAdminMaestro, async (req, re
 });
 
 // POST /clientes/listar
-// Body JSON esperado: { email, password }
+// Header: Authorization: Bearer <token>
 // Devuelve todos los clientes activos, para el selector de "Actualizar datos".
 router.post('/listar', soloAdminMaestro, async (req, res) => {
   try {
@@ -166,13 +191,13 @@ router.post('/listar', soloAdminMaestro, async (req, res) => {
 });
 
 // POST /clientes/actualizar
+// Header: Authorization: Bearer <token>  -> sesión del admin maestro
 // FormData esperado:
-//   email, password  -> credenciales del admin maestro
 //   sufijo            -> el cliente ya existente elegido en el selector
 //   archivo           -> el .xlsx/.csv con el catálogo nuevo completo
 // Borra TODOS los registros de inventario y TODOS los productos de ese
 // cliente, y los reemplaza por lo que traiga el archivo.
-router.post('/actualizar', upload.single('archivo'), soloAdminMaestro, async (req, res) => {
+router.post('/actualizar', soloAdminMaestro, subirArchivo, async (req, res) => {
   try {
     const sufijo = String(req.body.sufijo || '').trim().toUpperCase();
 
@@ -209,7 +234,7 @@ router.post('/actualizar', upload.single('archivo'), soloAdminMaestro, async (re
     }
 
     // ── PASO 3: Insertar el catálogo nuevo ──
-    const resultados = await insertarProductos(sufijo, filasNormalizadas);
+    const resultados = await insertarProductos(req.supabaseUsuario, sufijo, filasNormalizadas);
 
     return res.status(200).json({
       mensaje: 'Datos del cliente actualizados correctamente',
